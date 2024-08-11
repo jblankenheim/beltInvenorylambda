@@ -1,0 +1,163 @@
+const AWS = require('aws-sdk');
+
+////This code does not delete the record when required inventory hits zero.  That was a choice.  The belt may or may not be used again so admin can handle deletion of primary key record
+
+const dynamodb = new AWS.DynamoDB.DocumentClient();
+const beltInventoryTableName = 'BeltInventory';
+
+exports.handler = async (event) => {
+    for (const record of event.Records) {
+        const eventName = record.eventName;
+
+        if (eventName === 'INSERT' || eventName === 'MODIFY') {
+            try {
+                const newImage = record.dynamodb.NewImage;
+                const driveBeltSize = newImage.driveBeltSize.S;
+                const locationID = newImage.locationID.S;
+                const name = newImage.name.S;
+                const numberOfDriveBelts = parseInt(newImage.numberOfDriveBelts.N);
+                const locationName = newImage.locationName.S;
+
+                const beltInventoryParams = {
+                    TableName: beltInventoryTableName,
+                    Key: {
+                        'beltSize': driveBeltSize,
+                        'locationID': locationID
+                    }
+                };
+
+                const beltInventory = await dynamodb.get(beltInventoryParams).promise();
+
+                if (!beltInventory.Item) {
+                    // Insert Scenario
+                    await dynamodb.put({
+                        TableName: beltInventoryTableName,
+                        Item: {
+                            'beltSize': driveBeltSize,
+                            'locationID': locationID,
+                            'locationName': locationName, 
+                            'equipmentUsedOn': [name],
+                            'numberOfDriveBelts': numberOfDriveBelts
+                        }
+                    }).promise();
+                } else {
+                    //This is the update part of the first scenario
+                    await dynamodb.update({
+                        TableName: beltInventoryTableName,
+                        Key: {
+                            'beltSize': driveBeltSize,
+                            'locationID': locationID
+                        },
+                        UpdateExpression: 'SET numberOfDriveBelts = numberOfDriveBelts + :val ADD equipmentUsedOn :equipment',
+                        ExpressionAttributeValues: {
+                            ':val': numberOfDriveBelts,
+                            ':equipment': dynamodb.createSet([name])
+                        }
+                    }).promise();
+                }
+            } catch (err) {
+                console.error('Error processing record:', err);
+            }
+        } 
+
+     if (eventName === 'MODIFY') {
+            try {
+                const oldImage = record.dynamodb.OldImage;
+                const newImage = record.dynamodb.NewImage;
+                const driveBeltSize = newImage.driveBeltSize.S;
+                const locationID = newImage.locationID.S;
+                const nameOld = oldImage.name.S;
+                const nameNew = newImage.name.S;
+                const numberOfDriveBeltsOld = parseInt(oldImage.numberOfDriveBelts.N);
+                const numberOfDriveBeltsNew = parseInt(newImage.numberOfDriveBelts.N);
+
+                const beltInventoryParams = {
+                    TableName: beltInventoryTableName,
+                    Key: {
+                        'beltSize': driveBeltSize,
+                        'locationID': locationID
+                    }
+                };
+
+                const beltInventory = await dynamodb.get(beltInventoryParams).promise();
+
+                if (beltInventory.Item) {
+                    let { equipmentUsedOn, numberOfDriveBelts } = beltInventory.Item;
+
+                    // Modify equipmentUsedOn list if name has changed
+                    if (nameOld !== nameNew) {
+                        equipmentUsedOn = equipmentUsedOn.filter(e => e !== nameOld);
+                        equipmentUsedOn.push(nameNew);
+                    }
+
+                    
+                    const numberOfDriveBeltsDifference = numberOfDriveBeltsNew - numberOfDriveBeltsOld;
+                    const updatedNumberOfDriveBelts = numberOfDriveBelts + numberOfDriveBeltsDifference;
+
+                   
+                    await dynamodb.update({
+                        TableName: beltInventoryTableName,
+                        Key: {
+                            'beltSize': driveBeltSize,
+                            'locationID': locationID
+                        },
+                        UpdateExpression: 'SET equipmentUsedOn = :equipmentUsedOn, numberOfDriveBelts = :numberOfDriveBelts',
+                        ExpressionAttributeValues: {
+                            ':equipmentUsedOn': equipmentUsedOn,
+                            ':numberOfDriveBelts': updatedNumberOfDriveBelts
+                        }
+                    }).promise();
+                }
+            } catch (err) {
+                console.error('Error processing record:', err);
+            }
+        }
+      if (eventName === 'REMOVE') {
+          console.log(event)
+    try {
+        const oldImage = record.dynamodb.OldImage;
+        const driveBeltSize = oldImage.driveBeltSize.S;
+        const locationID = oldImage.locationID.S;
+        const name = oldImage.name.S;
+        const numberOfDriveBelts = parseInt(oldImage.numberOfDriveBelts.N);
+
+        const beltInventoryParams = {
+            TableName: beltInventoryTableName,
+            Key: {
+                'beltSize': driveBeltSize,
+                'locationID': locationID
+            }
+        };
+
+        const beltInventory = await dynamodb.get(beltInventoryParams).promise();
+
+        if (beltInventory.Item) {
+            let { equipmentUsedOn, numberOfDriveBelts } = beltInventory.Item;
+
+            // Remove the equipment name from the list if it exists
+            if (equipmentUsedOn.includes(name)) {
+                equipmentUsedOn = equipmentUsedOn.filter(e => e !== name);
+            }
+
+            // Update the number of drive belts by subtracting the numberOfDriveBelts
+            const updatedNumberOfDriveBelts = numberOfDriveBelts - numberOfDriveBelts;
+
+            await dynamodb.update({
+                TableName: beltInventoryTableName,
+                Key: {
+                    'beltSize': driveBeltSize,
+                    'locationID': locationID
+                },
+                UpdateExpression: 'SET equipmentUsedOn = :equipmentUsedOn, numberOfDriveBelts = :numberOfDriveBelts',
+                ExpressionAttributeValues: {
+                    ':equipmentUsedOn': equipmentUsedOn,
+                    ':numberOfDriveBelts': updatedNumberOfDriveBelts
+                }
+            }).promise();
+        }
+    } catch (err) {
+        console.error('Error processing record:', err);
+    }
+}
+    }
+};
