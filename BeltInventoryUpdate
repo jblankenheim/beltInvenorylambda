@@ -1,92 +1,145 @@
-const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
-const { DynamoDBDocumentClient, ScanCommand, UpdateCommand } = require('@aws-sdk/lib-dynamodb');
-const awsServerlessExpressMiddleware = require('aws-serverless-express/middleware');
-const express = require('express');
-const bodyParser = require('body-parser');
-const awsServerlessExpress = require('aws-serverless-express');
+const AWS = require('aws-sdk');
+const dynamodb = new AWS.DynamoDB.DocumentClient();
+const beltInventoryTableName = 'BeltInventory';
 
-const ddbClient = new DynamoDBClient({ region: process.env.TABLE_REGION });
-const ddbDocClient = DynamoDBDocumentClient.from(ddbClient);
+const insertEvent = async (newImage) => {
+    try {
+        const driveBeltSize = newImage.driveBeltSize.S;
+        const locationID = newImage.locationID.S;
+        const name = newImage.name.S;
+        const numberOfDriveBelts = parseInt(newImage.numberOfDriveBelts.N, 10);
+        const locationName = newImage.locationName.S;
 
-const tableName = 'BeltInventory';
-const path = '/BeltInventory';
+        const beltInventoryParams = {
+            TableName: beltInventoryTableName,
+            Key: {
+                'beltSize': driveBeltSize,
+                'locationID': locationID
+            }
+        };
 
-const app = express();
-app.use(bodyParser.json());
-app.use(awsServerlessExpressMiddleware.eventContext());
+        const beltInventory = await dynamodb.get(beltInventoryParams).promise();
 
-app.use(function(req, res, next) {
-  res.header("Access-Control-Allow-Origin", "*");
-  res.header("Access-Control-Allow-Headers", "*");
-  next();
-});
+        if (!beltInventory.Item) {
+            // Insert Scenario
+            await dynamodb.put({
+                TableName: beltInventoryTableName,
+                Item: {
+                    'beltSize': driveBeltSize,
+                    'locationID': locationID,
+                    'locationName': locationName,
+                    'equipmentUsedOn': [name],
+                    'numberOfDriveBelts': numberOfDriveBelts
+                }
+            }).promise();
+        } else {
+            // Update Scenario
+            const { equipmentUsedOn, numberOfDriveBelts: existingNumberOfDriveBelts } = beltInventory.Item;
 
+            // Prepare the update expression and values
+            const updatedNumberOfDriveBelts = existingNumberOfDriveBelts + numberOfDriveBelts;
 
-
-app.get(path, async function(req, res) {
-  const locationID = req.query.locationID; 
-  const scanParams = {
-    TableName: tableName
-  };
-
-  try {
-    const data = await ddbDocClient.send(new ScanCommand(scanParams));
-
-    let items = data.Items;
-    if (locationID !== 'all') {
-      items = items.filter(item => item.locationID === locationID);
+            // Use list_append to append to the equipmentUsedOn list
+            await dynamodb.update({
+                TableName: beltInventoryTableName,
+                Key: {
+                    'beltSize': driveBeltSize,
+                    'locationID': locationID
+                },
+                UpdateExpression: 'SET numberOfDriveBelts = :numberOfDriveBelts, equipmentUsedOn = list_append(equipmentUsedOn, :newEquipmentUsedOn)',
+                ExpressionAttributeValues: {
+                    ':numberOfDriveBelts': updatedNumberOfDriveBelts,
+                    ':newEquipmentUsedOn': [name] // list_append expects a list as the second parameter
+                }
+            }).promise();
+        }
+    } catch (err) {
+        console.error('Error processing INSERT event:', err);
     }
-    
-    res.json(items);
-  } catch (err) {
-    console.error('Error scanning DynamoDB:', err);
-    res.statusCode = 500;
-    res.json({ error: 'Could not load items: ' + err.message });
-  }
-});
+};
 
-/************************************
-* HTTP Put method to update objects *
-************************************/
+const removeEvent = async (oldImage) => {
+    try {
+        const driveBeltSize = oldImage.driveBeltSize.S;
+        const locationID = oldImage.locationID.S;
+        const nameToRemove = oldImage.name.S;
+        const numberOfDriveBeltsToRemove = oldImage.numberOfDriveBelts.N ? parseInt(oldImage.numberOfDriveBelts.N, 10) : 0;
 
-app.put(path, async function(req, res) {
-  const { locationID, beltSize, beltsInInventory, numberOfDriveBelts, equipmentUsedOn, loc } = req.body;
+        const beltInventoryParams = {
+            TableName: beltInventoryTableName,
+            Key: {
+                'beltSize': driveBeltSize,
+                'locationID': locationID
+            }
+        };
 
-  if (!locationID || !beltSize) {
-    res.statusCode = 400;
-    res.json({ error: 'Missing required parameters: locationID and beltSize' });
-    return;
-  }
+        const beltInventory = await dynamodb.get(beltInventoryParams).promise();
 
-  const updateParams = {
-    TableName: tableName,
-    Key: {
-      locationID: locationID,
-      beltSize: beltSize
-    },
-    UpdateExpression: 'set beltsInInventory = :beltsInInventory, loc = :loc',
-    ExpressionAttributeValues: {
-      ':beltsInInventory': beltsInInventory,
-      ':loc': loc
-    },
-    ReturnValues: 'ALL_NEW'
-  };
+        if (beltInventory.Item) {
+            let { equipmentUsedOn, numberOfDriveBelts } = beltInventory.Item;
 
-  try {
-    const result = await ddbDocClient.send(new UpdateCommand(updateParams));
-    res.json(result.Attributes);
-  } catch (err) {
-    console.error('Error updating DynamoDB:', err);
-    res.statusCode = 500;
-    res.json({ error: 'Could not update item: ' + err.message });
-  }
-});
+            // Remove the equipment name from the list if it exists
+            const updatedEquipmentUsedOn = equipmentUsedOn.filter(e => e !== nameToRemove);
 
-// Don't use app.listen() for Lambda, it's unnecessary
+            // Update the number of drive belts
+            const updatedNumberOfDriveBelts = numberOfDriveBelts - numberOfDriveBeltsToRemove;
 
-// Export the Lambda handler for AWS Lambda integration
-const server = awsServerlessExpress.createServer(app);
+            // Make sure we are not setting the number of drive belts to a negative value
+            const finalNumberOfDriveBelts = Math.max(updatedNumberOfDriveBelts, 0);
 
-exports.handler = (event, context) => {
-  return awsServerlessExpress.proxy(server, event, context);
+            // Update the DynamoDB table
+            await dynamodb.update({
+                TableName: beltInventoryTableName,
+                Key: {
+                    'beltSize': driveBeltSize,
+                    'locationID': locationID
+                },
+                UpdateExpression: 'SET equipmentUsedOn = :equipmentUsedOn, numberOfDriveBelts = :numberOfDriveBelts',
+                ExpressionAttributeValues: {
+                    ':equipmentUsedOn': updatedEquipmentUsedOn,  // Directly use the list
+                    ':numberOfDriveBelts': finalNumberOfDriveBelts
+                }
+            }).promise();
+        } else {
+            console.warn(`No item found with beltSize: ${driveBeltSize} and locationID: ${locationID}`);
+
+        }
+    } catch (err) {
+        console.error('Error processing REMOVE event:', err);
+    }
+};
+
+exports.handler = async (event) => {
+    for (const record of event.Records) {
+        const eventName = record.eventName;
+
+        if (eventName === 'INSERT') {
+            const newImage = record.dynamodb.NewImage;
+            if (newImage) {
+                await insertEvent(newImage);
+            } else {
+                console.error('Missing NewImage in INSERT event');
+            }
+        }
+
+        if (eventName === 'REMOVE') {
+            const oldImage = record.dynamodb.OldImage;
+            if (oldImage) {
+                await removeEvent(oldImage);
+            } else {
+                console.error('Missing OldImage in REMOVE event');
+            }
+        }
+
+        if (eventName === 'MODIFY') {
+            const oldImage = record.dynamodb.OldImage;
+            const newImage = record.dynamodb.NewImage;
+            if (oldImage && newImage) {
+                await removeEvent(oldImage);
+                await insertEvent(newImage);
+            } else {
+                console.error('Missing OldImage or NewImage in MODIFY event');
+            }
+        }
+    }
 };
